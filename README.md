@@ -76,7 +76,7 @@ pip install transformers datasets evaluate torch
 Then run the script:
 
 ```bash
-python project.py
+python run_model.py
 ```
 
 Make sure you are using Python 3.10+ and have PyTorch installed.
