@@ -1,68 +1,82 @@
-from transformers import GPT2LMHeadModel, GPT2TokenizerFast, Trainer, TrainingArguments, DataCollatorForLanguageModeling
-from datasets import load_dataset
 import math
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from datasets import load_dataset
 
-# 1. Load Dataset
+# Configuration
+MODEL_CHECKPOINT = "gpt2"
+BLOCK_SIZE = 128
+TRAIN_BATCH_SIZE = 8  # Increased from 2 for better GPU utilization if available
+EVAL_BATCH_SIZE = 8
+EPOCHS = 3           # Increased to 3 for better fine-tuning
+
+# --- 1. Load Dataset, Tokenizer, and Model ---
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
+model = AutoModelForCausalLM.from_pretrained(MODEL_CHECKPOINT)
 
-# 2. Load Tokenizer and set padding token
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-tokenizer.pad_token = tokenizer.eos_token
+# Set padding token for GPT-2 which doesn't have one by default
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+    model.resize_token_embeddings(len(tokenizer)) # Resize model embedding if pad token is new
 
-# 3. Tokenization Function
-def tokenize_function(example):
-    return tokenizer(example["text"], truncation=True, padding="max_length", max_length=128)
+# --- 2. Tokenization and Text Grouping ---
+def tokenize_function(examples):
+    # Process text in batches
+    return tokenizer(examples["text"])
 
-tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text", "id", "title"])
 
-# 4. Load Pre-trained GPT2 Model
-model = GPT2LMHeadModel.from_pretrained("gpt2")
-model.resize_token_embeddings(len(tokenizer))  # Add pad token support
+def group_texts(examples):
+    # Concatenate all texts.
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    # Drop the small remainder at the end
+    total_length = (total_length // BLOCK_SIZE) * BLOCK_SIZE
+    # Split by BLOCK_SIZE
+    result = {
+        k: [t[i : i + BLOCK_SIZE] for i in range(0, total_length, BLOCK_SIZE)]
+        for k, t in concatenated_examples.items()
+    }
+    # Create the labels for language modeling
+    result["labels"] = result["input_ids"].copy()
+    return result
 
-# 5. Define Data Collator
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-# 6. Training Arguments
-training_args = TrainingArguments(
-    output_dir="./gpt2-finetuned-wikitext2",
-    per_device_train_batch_size=2,
-    per_device_eval_batch_size=2,
-    num_train_epochs=1,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=10,
-    save_total_limit=2,
-    report_to="none",
-    logging_dir="./logs"
+lm_datasets = tokenized_datasets.map(
+    group_texts,
+    batched=True,
 )
 
-# 7. Trainer
+# --- 3. Define Data Collator and Training Arguments ---
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+training_args = TrainingArguments(
+    output_dir="./gpt2-finetuned-wikitext2-improved",
+    per_device_train_batch_size=TRAIN_BATCH_SIZE,
+    per_device_eval_batch_size=EVAL_BATCH_SIZE,
+    num_train_epochs=EPOCHS,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    logging_steps=50, # Increased logging frequency
+    save_total_limit=1,
+    report_to="none",
+    fp16=torch.cuda.is_available(), # Use mixed precision if a GPU is available
+)
+
+# --- 4. Trainer and Training ---
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["validation"],
+    train_dataset=lm_datasets["train"],
+    eval_dataset=lm_datasets["validation"],
     tokenizer=tokenizer,
-    data_collator=data_collator
+    data_collator=data_collator,
 )
 
-# 8. Start Training
 trainer.train()
 
-# 9. Evaluation: Compute Perplexity
-def compute_perplexity(eval_dataset):
-    model.eval()
-    losses = []
-    for i in range(len(eval_dataset)):
-        input_ids = torch.tensor(eval_dataset[i]['input_ids']).unsqueeze(0)  # Batch size 1
-        labels = input_ids.clone()
-        with torch.no_grad():
-            outputs = model(input_ids, labels=labels)
-            loss = outputs.loss.item()
-        losses.append(loss)
-    avg_loss = sum(losses) / len(losses)
-    return math.exp(avg_loss)
+# --- 5. Evaluation: Compute Perplexity ---
+eval_results = trainer.evaluate()
+perplexity = math.exp(eval_results["eval_loss"])
 
-# 10. Print Perplexity
-print("Perplexity:", compute_perplexity(tokenized_datasets["validation"]))
+print(f"Perplexity: {perplexity:.2f}")
